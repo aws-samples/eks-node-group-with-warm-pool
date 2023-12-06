@@ -1,0 +1,145 @@
+#!/bin/bash
+
+# shellcheck disable=SC2154,SC2001,SC1091,SC2086
+
+# Log user-data
+exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+set -x
+
+DATETIME=$(date -u '+%Y_%m_%d_T%H:%M:%SZ')
+echo "Script running at $DATETIME"
+
+function goto
+{
+  label=$1
+  cmd=$(sed -n "/^:[[:blank:]][[:blank:]]*$${label}/{:a;n;p;ba};" $0 | 
+        grep -v ':$')
+  eval "$cmd"
+  exit
+}
+
+TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 3600")
+REGION=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+DOMAIN=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/services/domain)
+PARTITION=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/services/partition)
+INSTANCE_ID=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+
+PROXY_URL=${outbound_proxy_url}
+if [[ -n "$PROXY_URL" ]]; then
+  # https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-proxy.html
+  export HTTPS_PROXY="$PROXY_URL" # enables calls to service APIs & IMDS
+
+  EKS_IPv4_RANGE=$(aws eks describe-cluster --region $REGION --name ${cluster_name} --query 'cluster.kubernetesNetworkConfig.serviceIpv4Cidr')
+  MAC=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/mac/)
+  VPC_CIDR=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" "http://169.254.169.254/latest/meta-data/network/interfaces/macs/$MAC/vpc-ipv4-cidr-blocks" | xargs | tr ' ' ',')
+
+  NO_PROXY_LIST=$EKS_IPv4_RANGE,$VPC_CIDR,localhost,127.0.0.1,169.254.169.254,.internal,.eks.$DOMAIN,${no_proxy_endpoints}
+  NO_PROXY_LIST=$(sed "s/,$//" <<< "$NO_PROXY_LIST")
+
+  # Set proxy for future processes
+  cloud-init-per instance env_proxy_config cat <<EOF >> /etc/environment
+http_proxy="$PROXY_URL"
+https_proxy="$PROXY_URL"
+no_proxy="$NO_PROXY_LIST"
+HTTP_PROXY="$PROXY_URL"
+HTTPS_PROXY="$PROXY_URL"
+NO_PROXY="$NO_PROXY_LIST"
+AWS_DEFAULT_REGION="$REGION"
+EOF
+
+  # Configure containerd for the proxy
+  mkdir -p /etc/systemd/system/containerd.service.d
+  cloud-init-per instance docker_proxy_config tee <<EOF /etc/systemd/system/containerd.service.d/http-proxy.conf >/dev/null
+[Service]
+EnvironmentFile=/etc/environment
+EOF
+
+  # Configure the sandbox-image for the proxy
+  mkdir -p /etc/systemd/system/sandbox-image.service.d
+  cloud-init-per instance docker_proxy_config tee <<EOF /etc/systemd/system/sandbox-image.service.d/http-proxy.conf >/dev/null
+[Service]
+EnvironmentFile=/etc/environment
+EOF
+
+  # Configure the kubelet for the proxy
+  cloud-init-per instance kubelet_proxy_config tee <<EOF /etc/systemd/system/kubelet.service.d/proxy.conf >/dev/null
+[Service]
+EnvironmentFile=/etc/environment
+EOF
+
+  # https://docs.aws.amazon.com/systems-manager/latest/userguide/sysman-proxy-with-ssm-agent.html#ssm-agent-proxy-systemd
+  mkdir /etc/systemd/system/amazon-ssm-agent.service.d
+  cat <<EOF >> /etc/systemd/system/amazon-ssm-agent.service.d/override.conf
+[Service]
+EnvironmentFile=/etc/environment
+EOF
+
+  # Reload the daemon to reflect proxy configurations at launch of instance; restart ssm agent
+  cloud-init-per instance reload_daemon systemctl daemon-reload
+  cloud-init-per instance restart_ssm systemctl restart amazon-ssm-agent
+
+fi
+
+ASG_NAME="$(aws autoscaling describe-auto-scaling-instances --instance-ids $INSTANCE_ID --region $REGION --query 'AutoScalingInstances[].AutoScalingGroupName')"
+LIFECYCLE_STATE="$(aws autoscaling describe-auto-scaling-instances --region $REGION --instance-id $INSTANCE_ID --query 'AutoScalingInstances[].LifecycleState' | tr -d '[' | tr -d ']')"
+IN_WARM_POOL="$(aws ec2 describe-tags --region $REGION --filters Name=resource-id,Values=$INSTANCE_ID Name=key,Values=InWarmPool --query 'Tags[].Value' | tr -d '[' | tr -d ']' )"
+
+if [[ ("$LIFECYCLE_STATE" == *Pending* || "$LIFECYCLE_STATE" == *Pending:Wait*) && "$IN_WARM_POOL" == *true* ]]; then
+  goto "bootstrapping"
+fi
+
+# update; https://aws.amazon.com/premiumsupport/knowledge-center/ec2-troubleshoot-yum-errors-al1-al2/
+yum update -y
+
+# Install CloudWatch agent. Instance needs the CloudWatchAgentServerPolicy or equivalent permissions to run the agent, and create logs.
+# https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/download-cloudwatch-agent-commandline.html
+# Install jq if using downloading the .json config from Parameter Store using file: option to render the file correctly
+if [[ "${enable_cloudwatch_agent}" == "true" ]]; then
+  # CW_AGENT_CONFIG_FILE_PATH="/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json"
+  yum install amazon-cloudwatch-agent -y
+  # Install collectd (optional)
+  amazon-linux-extras install collectd
+  # Download CloudWatch agent configuration file from Parameter Store. Using jq to properly render the json.
+  mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
+  /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c "ssm:${cloudwatch_agent_config_parameter_name}"
+fi
+
+# Bootstrapping. Only bootstrap if instance is not in warm pool.
+: bootstrapping
+
+if [[ "$LIFECYCLE_STATE" == *Warmed:Pending* || "$LIFECYCLE_STATE" == *Warmed:Pending:Wait* ]]; then
+  aws ec2 create-tags --region "$REGION" --resources "$INSTANCE_ID" --tags Key=InWarmPool,Value=true
+  cp "/var/log/user-data.log" "/var/log/user-data-$DATETIME"
+else
+  aws ec2 create-tags --region "$REGION" --resources "$INSTANCE_ID" --tags Key=InWarmPool,Value=false
+  if [[ "$PARTITION" == "aws-iso" ]]; then
+    bash -x /etc/eks/bootstrap.sh "${cluster_name}" --apiserver-endpoint "${cluster_endpoint}" --b64-cluster-ca "${cluster_certificate_authority}" --pause-container-account "${pause_container_account_id}" --container-runtime=containerd --kubelet-extra-args "${kubelet_extra_args}"
+  else bash -x /etc/eks/bootstrap.sh "${cluster_name}" --apiserver-endpoint "${cluster_endpoint}" --b64-cluster-ca "${cluster_certificate_authority}" --container-runtime=containerd --kubelet-extra-args "${kubelet_extra_args}"
+  fi
+fi
+
+# Check that lifecycle state is Warmed:Pending:Wait or Pending:Wait to ensure lifecycle hook has been triggered so it can be completed 
+# If you're using warm pools, it's b/c the initialization is long, so you should add a lifecycle hook to prevent the instance from being stopped and placed in a warm pool before the user-data finishes
+# Remember - the lifecycle of the instance is independent of the user-data
+# However, when the instance is launched from the warm pool, it will skip parts of the user-data (based on goto logic) and be very fast. 
+# Thus, you also need to guard against this case where the user data can finish up during the Warmed:Pending or Pending state,
+# which meanas the lifecycle command will fire before the instance is in a Pending:Wait state and, thus, the ASG will have missed the signal at the right time to continue
+# and will just hang waiting for the signal.
+
+while true
+do
+  if [[ "$LIFECYCLE_STATE" == *Pending:Wait* ]]; then
+    aws autoscaling complete-lifecycle-action \
+      --lifecycle-hook-name "finish_user_data" \
+      --auto-scaling-group-name "$ASG_NAME" \
+      --lifecycle-action-result CONTINUE \
+      --instance-id "$INSTANCE_ID" \
+      --region "$REGION"
+    break
+  fi
+  echo "Waiting for lifecycle hook to trigger..."
+  sleep 5
+done
+
+DATETIME_END=$(date -u '+%Y_%m_%d_T%H:%M:%SZ')
+echo "User data complete at $DATETIME_END"

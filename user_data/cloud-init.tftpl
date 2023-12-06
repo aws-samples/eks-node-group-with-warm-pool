@@ -1,0 +1,3 @@
+#cloud-config
+cloud_final_modules:
+- [scripts-user, always]

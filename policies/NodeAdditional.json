@@ -1,0 +1,30 @@
+{
+    "Statement": [
+        {
+            "Action": [
+                "autoscaling:DescribeAutoScalingInstances",
+                "autoscaling:CompleteLifecycleAction",
+                "ssm:CreateDocument",
+                "ssm:SendCommand"
+            ],
+            "Effect": "Allow",
+            "Resource": "*"
+        },
+        {
+            "Action": [
+                "ec2:CreateTags"
+            ],
+            "Effect": "Allow",
+            "Resource": "arn:${Partition}:ec2:${Region}:${Account}:instance/*",
+            "Condition": {
+                "StringEquals": {
+                    "aws:ResourceTag/kubernetes.io/cluster/${cluster_name}": "owned"
+                },
+                "ForAllValues:StringEquals": {
+                    "aws:TagKeys": ["InWarmPool"] 
+                }
+            }
+        }
+    ],
+    "Version": "2012-10-17"
+}
