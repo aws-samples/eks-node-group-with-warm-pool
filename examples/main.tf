@@ -67,7 +67,7 @@ module "eks" {
 
 module "smng" {
   source = "git::https://github.com/terraform-aws-modules/terraform-aws-eks.git//modules/self-managed-node-group?ref=dfed830957079301b879814e87608728576dd168"
-  count  = 1
+  count  = 0
 
   cluster_version                   = local.cluster_version
   cluster_name                      = local.name
