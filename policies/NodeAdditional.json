@@ -18,12 +18,19 @@
             "Resource": "arn:${Partition}:ec2:${Region}:${Account}:instance/*",
             "Condition": {
                 "StringEquals": {
-                    "aws:ResourceTag/kubernetes.io/cluster/${cluster_name}": "owned"
+                    "aws:ResourceTag/kubernetes.io/cluster/${ClusterName}": "owned"
                 },
                 "ForAllValues:StringEquals": {
                     "aws:TagKeys": ["InWarmPool"] 
                 }
             }
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "eks-auth:AssumeRoleForPodIdentity"
+            ],
+            "Resource": "arn:${Partition}:eks:${Region}:${Account}:cluster/${ClusterName}"
         }
     ],
     "Version": "2012-10-17"
