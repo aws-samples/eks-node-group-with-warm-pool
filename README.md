@@ -12,7 +12,6 @@ Notes:
 ## Prerequisites
 * [Terraform](https://www.terraform.io/)
 * [AWS Command Line Interface](https://aws.amazon.com/cli/)(CLI)
-* [aws-iam-authenticator](https://docs.aws.amazon.com/eks/latest/userguide/install-aws-iam-authenticator.html)
 * [kubectl](https://docs.aws.amazon.com/eks/latest/userguide/install-kubectl.html)
 * [Helm](https://helm.sh/)
 
@@ -25,7 +24,7 @@ terraform init
 terraform apply
 # enter "yes", if ready
 ```
-* Deploy the self-managed node group. Open [main.tf](examples/main.tf), find the `module "smng"` code block, and change `count` to `1`. Then, repeat the `terraform` commands from the previous step.
+* Deploy the self-managed node group. Open [main.tf](examples/main.tf), find the `module "smng"` code block, and change `count` to `1`. Then, repeat the `terraform apply` command from the previous step.
 
 ## Test
 * Add the cluster to your kubeconfig file for use with kubectl by running the command in the `configure_kubectl` output value. For example:
