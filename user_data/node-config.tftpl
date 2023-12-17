@@ -104,6 +104,9 @@ if [[ "${enable_cloudwatch_agent}" == "true" ]]; then
   /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c "ssm:${cloudwatch_agent_config_parameter_name}"
 fi
 
+# Use sleep command to simulate full initialization time. Remove from your actual implementation!
+sleep 3m
+
 # Bootstrapping. Only bootstrap if instance is not in warm pool.
 : bootstrapping
 

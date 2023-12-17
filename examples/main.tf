@@ -19,9 +19,10 @@ data "aws_partition" "current" {}
 data "aws_availability_zones" "available" {}
 
 locals {
-  name            = "blog"
+  name            = "example"
   region          = "us-west-2"
   cluster_version = "1.27"
+  eks_auth        = "IRSA" # IRSA (IAM roles for services accounts) or EKSPI (EKS pod identities); use IRSA, EKSPI not working yet
 
   vpc_cidr = "10.0.0.0/16"
   azs      = slice(data.aws_availability_zones.available.names, 0, 3)
@@ -65,8 +66,8 @@ module "eks" {
 ################################################################################
 
 module "smng" {
-  source = "git::https://github.com/terraform-aws-modules/terraform-aws-eks.git?ref=dfed830957079301b879814e87608728576dd168"
-  count = 0
+  source = "git::https://github.com/terraform-aws-modules/terraform-aws-eks.git//modules/self-managed-node-group?ref=dfed830957079301b879814e87608728576dd168"
+  count  = 0
 
   cluster_version                   = local.cluster_version
   cluster_name                      = local.name
@@ -175,7 +176,7 @@ module "vpc" {
 }
 
 module "vpc_endpoints" {
-  source = "git::https://github.com/terraform-aws-modules/terraform-aws-vpc.git?ref=bf9a89bf447a9c866dc0d30486aec5a24dbe2631"
+  source = "git::https://github.com/terraform-aws-modules/terraform-aws-vpc.git//modules/vpc-endpoints?ref=bf9a89bf447a9c866dc0d30486aec5a24dbe2631"
 
   vpc_id = module.vpc.vpc_id
 
@@ -245,18 +246,18 @@ data "template_cloudinit_config" "node" {
 
   part {
     content_type = "text/cloud-config"
-    content      = file("${path.cwd}/user_data/cloud-init.tftpl")
+    content      = file("../user_data/cloud-init.tftpl")
   }
   part {
     content_type = "text/x-shellscript"
-    content      = templatefile("${path.cwd}/user_data/node-config.tftpl", local.template_vars)
+    content      = templatefile("../user_data/node-config.tftpl", local.template_vars)
   }
 
 }
 
 resource "local_file" "user_data" {
   content  = data.template_cloudinit_config.node.rendered
-  filename = "${path.cwd}/user-data"
+  filename = "../user-data"
 }
 
 locals {
@@ -264,7 +265,9 @@ locals {
     Region       = local.region,
     Account      = data.aws_caller_identity.current.account_id
     Partition    = data.aws_partition.current.partition
-    cluster_name = module.eks.cluster_name
+    ClusterName  = module.eks.cluster_name
+    UrlSuffix    = data.aws_partition.current.dns_suffix
+    OidcProvider = module.eks.oidc_provider
   }
 
 }
@@ -272,10 +275,71 @@ locals {
 resource "aws_iam_policy" "node_additional" {
   name        = "${local.name}NodeAdditional"
   description = "Additional policy to enable warm pools"
-  policy      = templatefile("${path.cwd}/policies/NodeAdditional.json", local.policy_vars)
+  policy      = templatefile("../policies/NodeAdditional.json", local.policy_vars)
+}
+
+resource "aws_iam_policy" "cluster_autoscaler" {
+  name        = "${local.name}ClusterAutoscaler"
+  description = "Additional policy to enable the cluster autoscaler"
+  policy      = templatefile("../policies/ClusterAutoscaler.json", local.policy_vars)
+}
+
+locals {
+  trust_policy = local.eks_auth == "IRSA" ? "../policies/ClusterAutoscalerOidcTrust.json" : "../policies/EksPodIdentities.json"
+}
+
+resource "aws_iam_role" "cluster_autoscaler" {
+  name               = "${local.name}ClusterAutoscaler"
+  description        = "Additional role to enable the cluster autoscaler"
+  assume_role_policy = templatefile(local.trust_policy, local.policy_vars)
+}
+
+resource "aws_iam_role_policy_attachment" "cluster_autoscaler" {
+  role       = aws_iam_role.cluster_autoscaler.name
+  policy_arn = aws_iam_policy.cluster_autoscaler.arn
+}
+
+data "aws_eks_addon_version" "eks_pod_identities" {
+  addon_name         = "eks-pod-identity-agent"
+  kubernetes_version = local.cluster_version
+  most_recent        = true
+}
+
+resource "aws_eks_addon" "eks_pod_identities" {
+  count = local.eks_auth == "EKSPI" ? 1 : 0
+
+  cluster_name  = module.eks.cluster_name
+  addon_name    = "eks-pod-identity-agent"
+  addon_version = data.aws_eks_addon_version.eks_pod_identities.version
+}
+
+locals {
+  cluster_autoscaler_values = {
+    cluster_autoscaler_helm_repository_uri  = "https://kubernetes.github.io/autoscaler"
+    cluster_autoscaler_image_repository_uri = "registry.k8s.io/autoscaling/cluster-autoscaler"
+    cluster_autoscaler_image_tag            = "v1.27.5"
+    cluster_name                            = module.eks.cluster_name
+    cluster_autoscaler_role_arn             = aws_iam_role.cluster_autoscaler.arn
+    region                                  = local.region
+  }
+}
+
+resource "local_file" "cluster_autoscaler_helm_cmds" {
+  content  = templatefile("../helm/install_cluster_autoscaler.tftpl", local.cluster_autoscaler_values)
+  filename = "../helm/install_cluster_autoscaler.sh"
 }
 
 output "configure_kubectl" {
   description = "Run the following command to update your kubeconfig. You must be using the same AWS credentials that were used to create the cluster."
-  value       = "aws eks --region ${local.region} update-kubeconfig --name ${module.eks.cluster_name} --alias ${module.eks.cluster_name}"
+  value       = "aws eks update-kubeconfig --region ${local.region} --name ${module.eks.cluster_name} --alias ${module.eks.cluster_name}"
+}
+
+output "add_eks_pod_identity_agent" {
+  description = "Run the following command to deploy the EKS pod identity agent"
+  value       = local.eks_auth == "EKSPI" ? "aws eks create-addon --region ${local.region} --cluster-name ${module.eks.cluster_name} --addon-name eks-pod-identity-agent --addon-version v1.0.0-eksbuild.1" : null
+}
+
+output "create_pod_identity_association" {
+  description = "Run the following command to associate the Cluster Autoscaler service account with an IAM role."
+  value       = local.eks_auth == "EKSPI" ? "aws eks create-pod-identity-association --region ${local.region} --cluster-name ${module.eks.cluster_name} --role-arn ${aws_iam_role.cluster_autoscaler.arn} --namespace kube-system --service-account cluster-autoscaler" : null
 }
