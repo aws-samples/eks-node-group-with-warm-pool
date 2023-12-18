@@ -257,7 +257,7 @@ data "template_cloudinit_config" "node" {
 
 resource "local_file" "user_data" {
   content  = data.template_cloudinit_config.node.rendered
-  filename = "../user-data"
+  filename = "../user_data/user-data"
 }
 
 locals {
